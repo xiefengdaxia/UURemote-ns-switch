@@ -798,7 +798,9 @@ void Client::handle(const Event &event) {
         setState("signaling", "正在连接 UU 信令服务器…");
         socket_->open(url, room.at("token").get<std::string>());
         lastPacket_ = monotonicMs();
-        deadline_ = monotonicMs() + 45000;
+        // STUN/TURN 候选收集实测可达 40 秒（服务器下发的 ICE 配置较慢），
+        // 45 秒的总超时会让 ICE 几乎没有时间完成，这里放宽到 75 秒。
+        deadline_ = monotonicMs() + 75000;
     } else if (e == "input") {
         input(data);
     } else if (e == "release") {
@@ -813,6 +815,13 @@ void Client::handle(const Event &event) {
     } else if (e == "ice-state" || e == "gathering-state" || e == "signaling-state") {
         const auto label = "rtc-" + e + "-" + std::to_string(data.get<int>());
         diagnostic(label.c_str());
+        if (e == "gathering-state" &&
+            data.get<int>() == int(rtc::PeerConnection::GatheringState::Complete) && deadline_) {
+            // 候选收集完成后顺延 30 秒，保证 ICE/DTLS 有完整的时间窗口
+            const int64_t now = monotonicMs();
+            if (deadline_ < now + 30000)
+                deadline_ = now + 30000;
+        }
         if (e == "ice-state" && data != int(rtc::PeerConnection::IceState::Closed))
             iceState_ = static_cast<rtc::PeerConnection::IceState>(data.get<int>());
         if (e == "ice-state" &&
@@ -1267,7 +1276,8 @@ void Client::input(const Json &data) {
         return;
     const auto action = data.value("action", std::string{});
     if (it->second->bufferedAmount() > 64 * 1024 &&
-        (action == "mouse_move_absolute" || action == "mouse_scroll"))
+        (action == "mouse_move_absolute" || action == "mouse_scroll" ||
+         action == "finger_move_absolute" || action == "two_fingers_scroll"))
         return;
     auto s = data.dump();
     try {

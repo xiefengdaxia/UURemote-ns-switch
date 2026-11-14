@@ -157,7 +157,7 @@ std::string read(const std::string &path) {
 struct Controls {
     bool confirm = false, back = false, refresh = false, logout = false, up = false, down = false,
          help = false, disconnect = false, exit = false, qualitySwitch = false, fpsSwitch = false,
-         bitrateUp = false, bitrateDown = false, hud = false;
+         bitrateUp = false, bitrateDown = false, hud = false, touchToggle = false;
     float mx = 0, my = 0, scroll = 0;
     uint64_t held = 0;
 };
@@ -313,6 +313,13 @@ int main(int, char **) {
                 int diagFrames = 0, diagFps = 0;
                 long long diagLastMs = 0;
                 float cursorX = .5f, cursorY = .5f, focusY = 230;
+                // 触屏模式：单指 = 绝对定位 + 左键拖动，双指 = 滚动，长按 = 右键
+                bool touchMode = false, fingerDown = false, twoFinger = false, buttonHeld = false;
+                bool fingerMoved = false, longPressFired = false;
+                float lastAbsX = .5f, lastAbsY = .5f, lastTouchX = 0, lastTouchY = 0;
+                float fingerStartX = 0, fingerStartY = 0;
+                Uint32 lastFingerMove = 0, lastTwoFinger = 0, fingerStartMs = 0, lastScrollDiag = 0;
+                int touchDotX = -1, touchDotY = -1;
                 Uint32 previous = SDL_GetTicks(), lastScroll = 0, lastPointer = 0;
                 SDL_Texture *video = nullptr;
                 std::string qrUrl;
@@ -412,6 +419,7 @@ int main(int, char **) {
                     c.bitrateUp |= pressed & HidNpadButton_ZR;
                     c.bitrateDown |= pressed & HidNpadButton_ZL;
                     c.hud |= pressed & HidNpadButton_StickL;
+                    c.touchToggle |= pressed & HidNpadButton_StickR;
                     c.exit |= !state.streaming && (pressed & HidNpadButton_Plus);
                     auto stick = padGetStickPos(&pad, 0), right = padGetStickPos(&pad, 1);
                     auto axis = [](int v) {
@@ -431,6 +439,16 @@ int main(int, char **) {
                             overlay = !overlay;
                         if (c.hud)
                             hudVisible = !hudVisible;
+                        if (c.touchToggle) {
+                            touchMode = !touchMode;
+                            touchDotX = touchDotY = -1;
+                            fingerDown = false;
+                            twoFinger = false;
+                            if (buttonHeld) {
+                                send({{"action", "mouse_release"}, {"button", 1}});
+                                buttonHeld = false;
+                            }
+                        }
                         if (c.disconnect) {
                             client.command("disconnect");
                             continue;
@@ -470,22 +488,138 @@ int main(int, char **) {
                                       {"button", mouse}});
                         HidTouchScreenState touch{};
                         hidGetTouchScreenStates(&touch, 1);
-                        bool inside = false;
-                        if (touch.count) {
-                            auto p = touch.touches[0];
-                            inside = int(p.x) >= viewport.x && int(p.x) < viewport.x + viewport.w &&
-                                     int(p.y) >= viewport.y && int(p.y) < viewport.y + viewport.h;
-                            if (inside) {
-                                cursorX = (p.x - viewport.x) / float(viewport.w);
-                                cursorY = (p.y - viewport.y) / float(viewport.h);
-                                send({{"action", "mouse_move_absolute"},
-                                      {"abs_x", cursorX},
-                                      {"abs_y", cursorY}});
+                        const int touchCount = int(touch.count);
+                        touchDotX = touchDotY = -1;
+                        if (touchMode) {
+                            // 触屏模式：单指 = 远端触控事件；双指 = 滚动；离开画面区域按抬起处理
+                            auto normIn = [&](const HidTouchState &tp, float &ax, float &ay) {
+                                const bool in = int(tp.x) >= viewport.x &&
+                                                int(tp.x) < viewport.x + viewport.w &&
+                                                int(tp.y) >= viewport.y &&
+                                                int(tp.y) < viewport.y + viewport.h;
+                                if (!in)
+                                    return false;
+                                ax = (tp.x - viewport.x) / float(viewport.w);
+                                ay = (tp.y - viewport.y) / float(viewport.h);
+                                return true;
+                            };
+                            if (touchCount >= 2) {
+                                if (buttonHeld) {
+                                    send({{"action", "mouse_release"}, {"button", 1}});
+                                    buttonHeld = false;
+                                }
+                                fingerDown = false;
+                                const float mx = (touch.touches[0].x + touch.touches[1].x) * .5f;
+                                const float my = (touch.touches[0].y + touch.touches[1].y) * .5f;
+                                touchDotX = int(mx);
+                                touchDotY = int(my);
+                                if (!twoFinger) {
+                                    twoFinger = true;
+                                    lastTouchX = mx;
+                                    lastTouchY = my;
+                                } else if (now - lastTwoFinger >= 16) {
+                                    const int dx = int(mx - lastTouchX), dy = int(my - lastTouchY);
+                                    lastTouchX = mx;
+                                    lastTouchY = my;
+                                    if (dx || dy) {
+                                        lastTwoFinger = now;
+                                        if (now - lastScrollDiag > 1000) {
+                                            lastScrollDiag = now;
+                                            char line[32];
+                                            std::snprintf(line, sizeof line, "scroll-%d-%d", dx, dy);
+                                            uu::diagnostic(line);
+                                        }
+                                        send({{"action", "two_fingers_scroll"},
+                                              {"delta_x", dx},
+                                              {"delta_y", dy}});
+                                        send({{"action", "two_fingers_scroll"},
+                                              {"delta_x", 0},
+                                              {"delta_y", 0}});
+                                    }
+                                }
+                            } else if (touchCount == 1) {
+                                twoFinger = false;
+                                float ax = 0, ay = 0;
+                                if (normIn(touch.touches[0], ax, ay)) {
+                                    touchDotX = int(touch.touches[0].x);
+                                    touchDotY = int(touch.touches[0].y);
+                                    lastAbsX = ax;
+                                    lastAbsY = ay;
+                                    cursorX = ax;
+                                    cursorY = ay;
+                                    // 触屏语义 = 绝对定位 + 左键按下（mouse_* 已验证可用）
+                                    if (!fingerDown) {
+                                        fingerDown = true;
+                                        buttonHeld = true;
+                                        lastFingerMove = now;
+                                        fingerStartMs = now;
+                                        fingerStartX = touch.touches[0].x;
+                                        fingerStartY = touch.touches[0].y;
+                                        fingerMoved = false;
+                                        longPressFired = false;
+                                        send({{"action", "mouse_move_absolute"},
+                                              {"abs_x", ax},
+                                              {"abs_y", ay}});
+                                        send({{"action", "mouse_press"}, {"button", 1}});
+                                    } else {
+                                        if (std::abs(int(touch.touches[0].x) - int(fingerStartX)) > 10 ||
+                                            std::abs(int(touch.touches[0].y) - int(fingerStartY)) > 10)
+                                            fingerMoved = true;
+                                        // 长按（650ms 内几乎没移动）= 右键
+                                        if (!fingerMoved && !longPressFired &&
+                                            now - fingerStartMs >= 650) {
+                                            longPressFired = true;
+                                            if (buttonHeld) {
+                                                send({{"action", "mouse_release"}, {"button", 1}});
+                                                buttonHeld = false;
+                                            }
+                                            send({{"action", "mouse_move_absolute"},
+                                                  {"abs_x", ax},
+                                                  {"abs_y", ay}});
+                                            send({{"action", "mouse_press"}, {"button", 2}});
+                                            send({{"action", "mouse_release"}, {"button", 2}});
+                                        } else if (now - lastFingerMove >= 16) {
+                                            lastFingerMove = now;
+                                            send({{"action", "mouse_move_absolute"},
+                                                  {"abs_x", ax},
+                                                  {"abs_y", ay}});
+                                        }
+                                    }
+                                } else if (fingerDown) {
+                                    fingerDown = false;
+                                    if (buttonHeld) {
+                                        send({{"action", "mouse_release"}, {"button", 1}});
+                                        buttonHeld = false;
+                                    }
+                                }
+                            } else {
+                                twoFinger = false;
+                                fingerDown = false;
+                                if (buttonHeld) {
+                                    send({{"action", "mouse_release"}, {"button", 1}});
+                                    buttonHeld = false;
+                                }
                             }
-                        }
-                        if (inside != touchHeld) {
-                            send({{"action", inside ? "mouse_press" : "mouse_release"}, {"button", 1}});
-                            touchHeld = inside;
+                            touchHeld = false;
+                        } else {
+                            bool inside = false;
+                            if (touchCount) {
+                                auto p = touch.touches[0];
+                                inside = int(p.x) >= viewport.x && int(p.x) < viewport.x + viewport.w &&
+                                         int(p.y) >= viewport.y && int(p.y) < viewport.y + viewport.h;
+                                if (inside) {
+                                    cursorX = (p.x - viewport.x) / float(viewport.w);
+                                    cursorY = (p.y - viewport.y) / float(viewport.h);
+                                    send({{"action", "mouse_move_absolute"},
+                                          {"abs_x", cursorX},
+                                          {"abs_y", cursorY}});
+                                }
+                            }
+                            if (inside != touchHeld) {
+                                send({{"action", inside ? "mouse_press" : "mouse_release"},
+                                      {"button", 1}});
+                                touchHeld = inside;
+                            }
                         }
 #else
                         if (c.confirm) {
@@ -629,14 +763,25 @@ int main(int, char **) {
                             SDL_RenderCopy(renderer, video, nullptr, &viewport);
                         else
                             text(renderer, fonts.normal, "等待电脑发送画面…", 470, 330, muted);
-                        int x = viewport.x + int(cursorX * viewport.w),
-                            y = viewport.y + int(cursorY * viewport.h);
-                        drawCursor(renderer, x, y);
+                        if (touchMode) {
+                            // 触屏模式不显示鼠标箭头，触摸时画一个半透明指示圈
+                            if (touchDotX >= 0 && touchDotY >= 0) {
+                                for (int dy = -9; dy <= 9; ++dy) {
+                                    const int half = int(std::sqrt(double(81 - dy * dy)));
+                                    rect(renderer, touchDotX - half, touchDotY + dy, half * 2 + 1, 1,
+                                         {255, 255, 255, 150});
+                                }
+                            }
+                        } else {
+                            int x = viewport.x + int(cursorX * viewport.w),
+                                y = viewport.y + int(cursorY * viewport.h);
+                            drawCursor(renderer, x, y);
+                        }
                         if (overlay) {
                             rect(renderer, 0, 0, 1280, 68, {13, 19, 25, 225});
                             text(renderer, fonts.normal, "UU远程", 28, 18);
                             text(renderer, fonts.small,
-                                 "左摇杆 鼠标  ·  ZR/ZL 点击  ·  A 确认  ·  B Esc  ·  - 断开  ·  + 隐藏帮助  ·  L3 显隐HUD", 200,
+                                 "左摇杆 鼠标  ·  ZR/ZL 点击  ·  A 确认  ·  B Esc  ·  - 断开  ·  + 隐藏帮助  ·  L3 HUD  ·  R3 触屏模式", 200,
                                  24, muted);
                             rect(renderer, 0, 650, 1280, 70, {13, 19, 25, 225});
                             text(renderer, fonts.small,
@@ -654,7 +799,8 @@ int main(int, char **) {
                         if (hudVisible)
                             text(renderer, fonts.small,
                                  std::to_string(texW) + "x" + std::to_string(texH) + " · " +
-                                     std::to_string(diagFps) + "fps" + link,
+                                     std::to_string(diagFps) + "fps" + link +
+                                         (touchMode ? " · 触屏" : ""),
                                  990, 694, accent);
                     } else {
                         text(renderer, fonts.large, "UU远程", 62, 44);
