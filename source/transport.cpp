@@ -1,4 +1,5 @@
 #include "transport.hpp"
+#include "diagnostics.hpp"
 #include "auth.hpp"
 #include <chrono>
 #include <mbedtls/sha1.h>
@@ -100,23 +101,47 @@ Json Api::request(const std::string &method, const std::string &path, const Json
 void Api::initialize() {
     if (!device_.empty())
         return;
-    auto d = request("POST", "/api/v1/device/android_tv/init",
-                     {{"name", "UU远程 Switch 主控端"},
-                      {"client_id", client_},
-                      {"system_id", client_},
-                      {"system_version", "Horizon"},
-                      {"gaid", ""},
-                      {"install_id", client_},
-                      {"build_fingerprint", "uuremote-ns"},
-                      {"brand", "Nintendo"},
-                      {"manufacturer", "Nintendo"},
-                      {"model", "Switch"},
-                      {"product", "uuremote-ns"},
-                      {"rom", ""},
-                      {"abi", "arm64-v8a"},
-                      {"resolution", "1280x720"},
-                      {"screen_size", ""},
-                      {"dpi", 96}});
+    // 假设实验：TV/安卓身份疑似被服务器套大屏弱网码率策略（~2.5M 帽），
+    // windows 身份（linux-uuremote viewer 真机验证）无此限制。
+    // windows 注册失败自动回退 android_tv，行为退化为原状。
+    Json d;
+    bool windowsOk = false;
+    try {
+        d = request("POST", "/api/v1/device/windows/init",
+                    {{"name", "Switch"},
+                     {"client_id", client_},
+                     {"system_id", client_},
+                     {"machine_guid", client_},
+                     {"os", "Windows 10 64bit"},
+                     {"base_board", "Nintendo NX"},
+                     {"cpu", "ARM64"},
+                     {"video", Json::array({"Nintendo Switch"})},
+                     {"mac", ""},
+                     {"memory", 4096},
+                     {"screen", "1280x720"}});
+        windowsOk = true;
+        diagnostic("device-init-windows");
+    } catch (...) {
+        diagnostic("device-init-windows-fail");
+    }
+    if (!windowsOk)
+        d = request("POST", "/api/v1/device/android_tv/init",
+                    {{"name", "UU远程 Switch 主控端"},
+                     {"client_id", client_},
+                     {"system_id", client_},
+                     {"system_version", "Horizon"},
+                     {"gaid", ""},
+                     {"install_id", client_},
+                     {"build_fingerprint", "uuremote-ns"},
+                     {"brand", "Nintendo"},
+                     {"manufacturer", "Nintendo"},
+                     {"model", "Switch"},
+                     {"product", "uuremote-ns"},
+                     {"rom", ""},
+                     {"abi", "arm64-v8a"},
+                     {"resolution", "1280x720"},
+                     {"screen_size", ""},
+                     {"dpi", 96}});
     device_ = d.value("device_id", std::string{});
     if (device_.empty() && d.contains("current_device"))
         device_ = d["current_device"].value("device_id", std::string{});

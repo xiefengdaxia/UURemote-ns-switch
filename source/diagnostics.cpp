@@ -1,11 +1,15 @@
 #include "diagnostics.hpp"
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <deque>
 #include <mutex>
 #include <new>
 #include <stdexcept>
+#include <string>
 #include <system_error>
+#include <thread>
 #ifdef __SWITCH__
 #include <switch.h>
 #include <unwind.h>
@@ -20,24 +24,73 @@ const char *diagnosticPath() noexcept {
     return "connection.log";
 #endif
 }
+namespace {
+// 日志写入必须在单独线程：此前在 RTP 接收线程里同步 fopen/fflush/fclose
+// （Switch 的 SD 卡一次可能几十毫秒）会阻塞收包，造成 UDP 缓冲区溢出丢包。
+std::mutex gLogMutex;
+std::condition_variable gLogCv;
+std::deque<std::string> gLogQueue;
+bool gLogStop = false;
+std::thread gLogThread;
+void writeBatch(const std::deque<std::string> &lines) {
+    if (lines.empty())
+        return;
+    auto *file = std::fopen(diagnosticPath(), "a");
+    if (!file)
+        return;
+    std::fseek(file, 0, SEEK_END);
+    long size = std::ftell(file);
+    // 滚动阈值留足余量：预算耗尽时必须重置，否则文件卡在上限后再也写不进任何行。
+    if (size > 96 * 1024) {
+        std::fclose(file);
+        file = std::fopen(diagnosticPath(), "w");
+        if (!file)
+            return;
+        size = 0;
+    }
+    size_t budget = size_t(128 * 1024 - size);
+    for (const auto &line : lines) {
+        const size_t need = line.size() + 1;
+        if (need > budget)
+            break;
+        budget -= need;
+        std::fprintf(file, "%s\n", line.c_str());
+    }
+    std::fflush(file);
+    std::fclose(file);
+}
+void logWriter() {
+    for (;;) {
+        std::deque<std::string> batch;
+        {
+            std::unique_lock lock(gLogMutex);
+            gLogCv.wait(lock, [] { return gLogStop || !gLogQueue.empty(); });
+            if (gLogQueue.empty())
+                return;
+            while (!gLogQueue.empty() && batch.size() < 128) {
+                batch.push_back(std::move(gLogQueue.front()));
+                gLogQueue.pop_front();
+            }
+        }
+        writeBatch(batch);
+    }
+}
+void ensureLogThread() {
+    static std::once_flag once;
+    std::call_once(once, [] { gLogThread = std::thread(logWriter); });
+}
+} // namespace
 void diagnostic(const char *event) noexcept {
     // Fixed names, numeric error codes and code offsets only; never log protocol data.
     try {
-        static std::mutex mutex;
-        std::lock_guard lock(mutex);
-        auto *file = std::fopen(diagnosticPath(), "a");
-        if (!file)
-            return;
-        std::fseek(file, 0, SEEK_END);
-        if (std::ftell(file) > 128 * 1024) {
-            std::fclose(file);
-            file = std::fopen(diagnosticPath(), "w");
-            if (!file)
-                return;
-        }
-        std::fprintf(file, "%lld %s\n", static_cast<long long>(std::time(nullptr)), event);
-        std::fflush(file);
-        std::fclose(file);
+        ensureLogThread();
+        char prefix[24];
+        std::snprintf(prefix, sizeof prefix, "%lld ", static_cast<long long>(std::time(nullptr)));
+        std::lock_guard lock(gLogMutex);
+        if (gLogQueue.size() >= 512)
+            return; // 拥塞时丢弃，绝不阻塞调用方
+        gLogQueue.emplace_back(std::string(prefix) + event);
+        gLogCv.notify_one();
     } catch (...) {
     }
 }
@@ -68,6 +121,17 @@ void diagnosticException(const char *event, std::exception_ptr error) noexcept {
         diagnostic("exception-summary-unavailable");
     }
 }
+void flushDiagnostics() noexcept {
+    try {
+        std::deque<std::string> batch;
+        {
+            std::lock_guard lock(gLogMutex);
+            batch.swap(gLogQueue);
+        }
+        writeBatch(batch);
+    } catch (...) {
+    }
+}
 [[noreturn]] void terminateWithDiagnostics() noexcept {
     diagnosticException("runtime-terminate", std::current_exception());
 #ifdef __SWITCH__
@@ -87,6 +151,7 @@ void diagnosticException(const char *event, std::exception_ptr error) noexcept {
         &depth);
     // libc abort/exit can tear down the shared window while the UI thread is presenting.
     // Exit the process directly after saving evidence, without running global destructors.
+    flushDiagnostics();
     svcExitProcess();
 #else
     std::abort();

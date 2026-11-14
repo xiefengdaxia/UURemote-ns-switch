@@ -16,6 +16,10 @@ class Api {
                  int timeout = 20000);
     void initialize();
     void login(const Json &result);
+    void restore(std::string user, std::string token) {
+        user_ = std::move(user);
+        token_ = std::move(token);
+    }
     void logout() {
         token_.clear();
         user_.clear();

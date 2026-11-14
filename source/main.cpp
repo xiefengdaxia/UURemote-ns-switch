@@ -1,15 +1,21 @@
 #include "background.hpp"
 #include "client.hpp"
+#include "devsupport.hpp"
 #include "diagnostics.hpp"
 #include "qrcodegen.hpp"
 #include "rtc_diagnostics.hpp"
 #include <SDL_ttf.h>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <exception>
+#include <mutex>
+#include <thread>
 #include <fstream>
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <sys/stat.h>
 #ifdef __SWITCH__
 #include <switch.h>
@@ -27,6 +33,32 @@ void rect(SDL_Renderer *r, int x, int y, int w, int h, SDL_Color c) {
     color(r, c);
     SDL_Rect a{x, y, w, h};
     SDL_RenderFillRect(r, &a);
+}
+// 电脑端画面里捕获不到系统光标时，本地画一个标准箭头（白填充+黑描边，
+// 亮暗背景下都可见），比十字标记更接近桌面原生的观感。
+void drawCursor(SDL_Renderer *r, int x, int y) {
+    static const char *const kMask[] = {
+        "X...........", "XX..........", "X#X.........", "X##X........",
+        "X###X.......", "X####X......", "X#####X.....", "X######X....",
+        "X#######X...", "X########X..", "X#####XXXXX.", "X##X##X.....",
+        "X#X.X##X....", "XX..X##X....", "X....X##X...", ".....X##X...",
+        "......X##X..", "......X##X..", ".......XX...",
+    };
+    constexpr int cell = 2;
+    constexpr SDL_Color outline{0, 0, 0, 255}, fill{255, 255, 255, 255};
+    const int rows = int(sizeof kMask / sizeof kMask[0]);
+    for (int pass = 0; pass < 2; ++pass) {
+        color(r, pass == 0 ? outline : fill);
+        const char mark = pass == 0 ? 'X' : '#';
+        for (int row = 0; row < rows; ++row) {
+            for (int col = 0; kMask[row][col]; ++col) {
+                if (kMask[row][col] != mark)
+                    continue;
+                SDL_Rect a{x + col * cell, y + row * cell, cell, cell};
+                SDL_RenderFillRect(r, &a);
+            }
+        }
+    }
 }
 void text(SDL_Renderer *r, TTF_Font *f, const std::string &s, int x, int y, SDL_Color c = white,
           int maxWidth = 1200) {
@@ -124,7 +156,8 @@ std::string read(const std::string &path) {
 }
 struct Controls {
     bool confirm = false, back = false, refresh = false, logout = false, up = false, down = false,
-         help = false, disconnect = false, exit = false;
+         help = false, disconnect = false, exit = false, qualitySwitch = false, fpsSwitch = false,
+         bitrateUp = false, bitrateDown = false, hud = false;
     float mx = 0, my = 0, scroll = 0;
     uint64_t held = 0;
 };
@@ -169,7 +202,15 @@ int main(int, char **) {
         consoleExit(nullptr);
         return 0;
     }
-    socketInitializeDefault();
+    // 默认 UDP 接收缓冲只有 0xA500（42KB）——视频按帧突发到达，网络线程稍有
+    // 调度延迟就会溢出丢包（实测 4~8%），进而触发 IDR/降码率。这里提高接收
+    // 缓冲池；申请失败则回退默认配置，保证网络可用。
+    {
+        SocketInitConfig cfg = *socketGetDefaultInitConfig();
+        cfg.udp_rx_buf_size = 0x40000; // 256KB
+        if (R_FAILED(socketInitialize(&cfg)))
+            socketInitializeDefault();
+    }
     nifmInitialize(NifmServiceType_User);
     sslInitialize(0);
     romfsInit();
@@ -201,6 +242,8 @@ int main(int, char **) {
             SDL_RenderSetLogicalSize(renderer, 1280, 720);
             SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
             Fonts fonts;
+            // 签名 key 不随源码分发：由 scripts/extract_key.py 从使用者自己的
+            // UU TV APK 提取到 romfs/signing.key（构建时打进 RomFS）；缺失则拒绝启动。
 #ifdef __SWITCH__
             std::string key = read("romfs:/signing.key");
             const std::string profile = "sdmc:/switch/UURemote-ns/client-id";
@@ -210,7 +253,8 @@ int main(int, char **) {
             const std::string profile = "client-id";
 #endif
             if (key.size() != 24)
-                throw std::runtime_error("Missing signing.key: run scripts/extract_key.py and rebuild");
+                throw std::runtime_error(
+                    "缺少签名 key：请先用 scripts/extract_key.py 从自己的 UU TV APK 提取并重新构建");
             uu::diagnostic("app-start-" UU_VERSION);
             std::set_terminate(uu::terminateWithDiagnostics);
             rtc::InitLogger(rtc::LogLevel::Info, [](rtc::LogLevel, const std::string &message) {
@@ -223,15 +267,46 @@ int main(int, char **) {
                 id = uu::uuid();
                 std::ofstream(profile) << id;
             }
+            const std::string settingsPath =
+#ifdef __SWITCH__
+                "sdmc:/switch/UURemote-ns/settings";
+#else
+                "settings";
+#endif
+            const std::string sessionPath =
+#ifdef __SWITCH__
+                "sdmc:/switch/UURemote-ns/session";
+#else
+                "session";
+#endif
+            int fps = 30, quality = 1, bitrateIdx = 3;
+            static const int bitrateSteps[] = {1, 2, 3, 4, 6, 8, 10, 15, 20}; // Mbps，画质=自定义时生效
+            {
+                std::istringstream saved(read(settingsPath));
+                int f = 0, q = 0, b = 3;
+                if (saved >> f >> q && (f == 30 || f == 60) && q >= 1 && q <= 6) {
+                    if (!(saved >> b) || b < 0 || b > 8)
+                        b = 3;
+                    fps = f;
+                    quality = q;
+                    bitrateIdx = b;
+                }
+            }
+            auto saveSettings = [&] {
+                std::ofstream(settingsPath) << fps << ' ' << quality << ' ' << bitrateIdx << '\n';
+            };
             auto media = std::make_shared<uu::Media>();
             {
-                uu::Client client(key, id, media);
+                uu::Client client(key, id, media, sessionPath);
 #ifdef __SWITCH__
                 FocusHook focusHook(client);
 #endif
-                bool running = true, overlay = true, wasStreaming = false, touchHeld = false;
+                bool running = true, overlay = true, wasStreaming = false, touchHeld = false,
+                     hudVisible = true;
                 int selected = 0, texW = 0, texH = 0;
                 uint64_t serial = 0, lastHeld = 0;
+                int diagFrames = 0, diagFps = 0;
+                long long diagLastMs = 0;
                 float cursorX = .5f, cursorY = .5f, focusY = 230;
                 Uint32 previous = SDL_GetTicks(), lastScroll = 0, lastPointer = 0;
                 SDL_Texture *video = nullptr;
@@ -240,6 +315,30 @@ int main(int, char **) {
                 SmsForm sms;
                 SDL_Rect viewport{0, 0, 1280, 720};
                 auto send = [&](const uu::Json &data) { client.command("input", data); };
+                std::atomic<bool> devStop{false};
+                std::mutex devNoticeMutex;
+                std::string devNotice;
+                std::thread devThread([&] {
+                    auto bases = uu::loadDevServers();
+                    int waited = 0;
+                    while (!devStop.load()) {
+                        std::this_thread::sleep_for(std::chrono::seconds(1));
+                        if (++waited < 15 || bases.empty())
+                            continue;
+                        waited = 0;
+                        auto ver = uu::devTick(bases,
+#ifdef __SWITCH__
+                                               "sdmc:/switch/UURemote-ns/connection.log",
+                                               "sdmc:/switch/UURemote-ns/UURemote-ns.nro");
+#else
+                                               "connection.log", "UURemote-ns.nro");
+#endif
+                        if (!ver.empty()) {
+                            std::lock_guard lk(devNoticeMutex);
+                            devNotice = "已自动更新到 v" + ver + "，按 + 退出再重新打开生效";
+                        }
+                    }
+                });
                 while (running) {
 #ifdef __SWITCH__
                     if (!appletMainLoop())
@@ -303,6 +402,11 @@ int main(int, char **) {
                     c.down |= pressed & HidNpadButton_Down;
                     c.help |= pressed & HidNpadButton_Plus;
                     c.disconnect |= pressed & HidNpadButton_Minus;
+                    c.qualitySwitch |= pressed & HidNpadButton_L;
+                    c.fpsSwitch |= pressed & HidNpadButton_R;
+                    c.bitrateUp |= pressed & HidNpadButton_ZR;
+                    c.bitrateDown |= pressed & HidNpadButton_ZL;
+                    c.hud |= pressed & HidNpadButton_StickL;
                     c.exit |= !state.streaming && (pressed & HidNpadButton_Plus);
                     auto stick = padGetStickPos(&pad, 0), right = padGetStickPos(&pad, 1);
                     auto axis = [](int v) {
@@ -320,6 +424,8 @@ int main(int, char **) {
                     if (state.streaming) {
                         if (c.help)
                             overlay = !overlay;
+                        if (c.hud)
+                            hudVisible = !hudVisible;
                         if (c.disconnect) {
                             client.command("disconnect");
                             continue;
@@ -387,6 +493,26 @@ int main(int, char **) {
                         }
 #endif
                     } else {
+                        if (!busy && state.authenticated) {
+                            if (c.qualitySwitch) {
+                                quality = quality % 6 + 1;
+                                saveSettings();
+                            }
+                            if (c.fpsSwitch) {
+                                fps = fps == 30 ? 60 : 30;
+                                saveSettings();
+                            }
+                            if (quality == 6) {
+                                if (c.bitrateUp && bitrateIdx < 8) {
+                                    bitrateIdx++;
+                                    saveSettings();
+                                }
+                                if (c.bitrateDown && bitrateIdx > 0) {
+                                    bitrateIdx--;
+                                    saveSettings();
+                                }
+                            }
+                        }
                         if (wasStreaming) {
                             if (video) {
                                 SDL_DestroyTexture(video);
@@ -394,6 +520,8 @@ int main(int, char **) {
                             }
                             serial = 0;
                             texW = texH = 0;
+                            diagFrames = diagFps = 0;
+                            diagLastMs = 0;
                             overlay = true;
                             touchHeld = false;
                         }
@@ -455,7 +583,10 @@ int main(int, char **) {
                                     client.command("refresh");
                                 else if (state.devices[selected].value("status", std::string{}) != "offline")
                                     client.command("connect",
-                                                   {{"deviceId", state.devices[selected]["device_id"]}});
+                                                   {{"deviceId", state.devices[selected]["device_id"]},
+                                                    {"fps", fps},
+                                                    {"quality", quality},
+                                                    {"customBps", bitrateSteps[bitrateIdx] * 1000000LL}});
                             }
                         }
                     }
@@ -465,21 +596,29 @@ int main(int, char **) {
                     SDL_RenderClear(renderer);
                     if (state.streaming) {
                         auto p = media->picture(serial);
-                        if (p.serial) {
-                            if (p.width != texW || p.height != texH) {
+                        if (p && p->serial != serial) {
+                            if (p->width != texW || p->height != texH) {
                                 if (video)
                                     SDL_DestroyTexture(video);
                                 video = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32,
-                                                          SDL_TEXTUREACCESS_STREAMING, p.width, p.height);
-                                texW = p.width;
-                                texH = p.height;
+                                                          SDL_TEXTUREACCESS_STREAMING, p->width, p->height);
+                                texW = p->width;
+                                texH = p->height;
                             }
                             if (video)
-                                SDL_UpdateTexture(video, nullptr, p.pixels.data(), p.width * 4);
-                            serial = p.serial;
-                            float scale = std::min(1280.f / p.width, 720.f / p.height);
-                            viewport = {int((1280 - p.width * scale) / 2), int((720 - p.height * scale) / 2),
-                                        int(p.width * scale), int(p.height * scale)};
+                                SDL_UpdateTexture(video, nullptr, p->pixels.data(), p->width * 4);
+                            serial = p->serial;
+                            diagFrames++;
+                            if (!diagLastMs)
+                                diagLastMs = uu::monotonicMs();
+                            else if (uu::monotonicMs() - diagLastMs >= 1000) {
+                                diagFps = int(diagFrames * 1000 / (uu::monotonicMs() - diagLastMs));
+                                diagFrames = 0;
+                                diagLastMs = uu::monotonicMs();
+                            }
+                            float scale = std::min(1280.f / p->width, 720.f / p->height);
+                            viewport = {int((1280 - p->width * scale) / 2), int((720 - p->height * scale) / 2),
+                                        int(p->width * scale), int(p->height * scale)};
                         }
                         if (video)
                             SDL_RenderCopy(renderer, video, nullptr, &viewport);
@@ -487,13 +626,12 @@ int main(int, char **) {
                             text(renderer, fonts.normal, "等待电脑发送画面…", 470, 330, muted);
                         int x = viewport.x + int(cursorX * viewport.w),
                             y = viewport.y + int(cursorY * viewport.h);
-                        rect(renderer, x - 5, y, 11, 2, accent);
-                        rect(renderer, x, y - 5, 2, 11, accent);
+                        drawCursor(renderer, x, y);
                         if (overlay) {
                             rect(renderer, 0, 0, 1280, 68, {13, 19, 25, 225});
                             text(renderer, fonts.normal, "UU远程", 28, 18);
                             text(renderer, fonts.small,
-                                 "左摇杆 鼠标  ·  ZR/ZL 点击  ·  A 确认  ·  B Esc  ·  − 断开  ·  + 隐藏", 200,
+                                 "左摇杆 鼠标  ·  ZR/ZL 点击  ·  A 确认  ·  B Esc  ·  - 断开  ·  + 隐藏帮助  ·  L3 显隐HUD", 200,
                                  24, muted);
                             rect(renderer, 0, 650, 1280, 70, {13, 19, 25, 225});
                             text(renderer, fonts.small,
@@ -501,9 +639,26 @@ int main(int, char **) {
                                  28, 665, muted);
                             text(renderer, fonts.small, media->status(), 28, 694, muted);
                         }
+                        std::string link;
+                        if (state.pairType.find("relay") != std::string::npos)
+                            link = " · 中继";
+                        else if (state.pairType == "host/host")
+                            link = " · 直连";
+                        else if (!state.pairType.empty())
+                            link = " · 穿透";
+                        if (hudVisible)
+                            text(renderer, fonts.small,
+                                 std::to_string(texW) + "x" + std::to_string(texH) + " · " +
+                                     std::to_string(diagFps) + "fps" + link,
+                                 990, 694, accent);
                     } else {
                         text(renderer, fonts.large, "UU远程", 62, 44);
                         text(renderer, fonts.small, "NINTENDO SWITCH  v" UU_VERSION, 270, 69, accent);
+                        {
+                            std::lock_guard lk(devNoticeMutex);
+                            if (!devNotice.empty())
+                                text(renderer, fonts.small, devNotice, 270, 91, muted);
+                        }
                         text(renderer, fonts.small, state.authenticated ? state.nickname : "尚未登录", 930,
                              69, muted, 280);
                         rect(renderer, 62, 127, 1156, 1, {44, 56, 67, 255});
@@ -598,6 +753,18 @@ int main(int, char **) {
                             rect(renderer, 729, 248, 334, 192, {17, 25, 33, 255});
                             rect(renderer, 886, 451, 20, 45, {44, 56, 67, 255});
                             rect(renderer, 837, 495, 118, 6, {44, 56, 67, 255});
+                            static const char *qualityNames[] = {"流畅", "高清", "超清", "原画", "自动",
+                                                                 "自定义"};
+                            bool custom = quality == 6;
+                            text(renderer, fonts.small,
+                                 std::string("L 画质  ") + qualityNames[quality - 1], 762, 364, white);
+                            text(renderer, fonts.small, "R 帧率  " + std::to_string(fps) + " fps", 762, 386,
+                                 white);
+                            text(renderer, fonts.small,
+                                 "ZR/ZL 码率  " + std::to_string(bitrateSteps[bitrateIdx]) + " Mbps",
+                                 762, 408, custom ? white : muted);
+                            text(renderer, fonts.small,
+                                 custom ? "仅自定义画质档生效" : "切换后断开重连生效", 762, 430, muted);
                             text(renderer, fonts.small, "独立连接原版 UU 电脑端", 762, 535, muted);
                         }
                         if (busy || state.stage == "login") {
@@ -612,18 +779,22 @@ int main(int, char **) {
                                        state.stage == "error" ? SDL_Color{255, 157, 141, 255} : muted);
                         rect(renderer, 62, 653, 1156, 1, {44, 56, 67, 255});
                         text(renderer, fonts.small,
-                             state.authenticated ? "A 确认    B 返回    Y 刷新    X 退出账号"
-                                                 : "A 确认    B 返回    X 切换登录方式",
+                             state.authenticated
+                                 ? "A 确认    B 返回    Y 刷新    X 退出账号    L 画质    R 帧率    ZR/ZL 码率"
+                                 : "A 确认    B 返回    X 切换登录方式",
                              62, 675, muted);
                         text(renderer, fonts.small, "+ 退出", 1120, 675, muted);
                     }
                     SDL_RenderPresent(renderer);
                 }
+                devStop = true;
+                if (devThread.joinable())
+                    devThread.join();
                 if (video)
                     SDL_DestroyTexture(video);
             }
-            rtc::Cleanup().wait();
             uu::waitBackgroundTasks();
+            rtc::Cleanup().wait();
             media.reset();
             SDL_DestroyRenderer(renderer);
             SDL_DestroyWindow(window);
@@ -635,8 +806,8 @@ int main(int, char **) {
         result = 1;
         uu::diagnosticException("main-exception", std::current_exception());
         try {
-            rtc::Cleanup().wait();
             uu::waitBackgroundTasks();
+            rtc::Cleanup().wait();
         } catch (...) {
             uu::diagnosticException("cleanup-exception", std::current_exception());
         }

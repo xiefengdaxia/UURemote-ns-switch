@@ -99,15 +99,17 @@ std::string sign(const std::string &key, const std::string &method, const std::s
 Headers requestHeaders(const std::string &key, const std::string &method, const std::string &path,
                        const std::string &body, const std::string &client, const std::string &device,
                        const std::string &user, int64_t timestamp) {
+    // PC 客户端身份（plat=1）：TV/安卓身份会被服务器按大屏弱网策略限制码率，
+    // 且"控制端版本较低"比对的是这里的 VN 与被控端版本。
     Headers h = {{"X-Param-CHN", "gwqd"},
                  {"X-Param-OPR", ""},
                  {"X-Param-PKGN", "com.netease.uuremote"},
-                 {"X-Param-PLAT", "5"},
+                 {"X-Param-PLAT", "1"},
                  {"X-Param-REL", "prod"},
                  {"X-Param-TS", std::to_string(timestamp)},
-                 {"X-Param-VC", "30500"},
-                 {"X-Param-VN", "3.5.0"},
-                 {"X-Param-ABI", "arm64-v8a"},
+                 {"X-Param-VC", "44604716"},
+                 {"X-Param-VN", "4.46.0.4716"},
+                 {"X-Param-ABI", "x86_64"},
                  {"X-Param-client-id", client},
                  {"X-Param-device-id", device},
                  {"X-Param-user-id", user},
@@ -137,7 +139,13 @@ static void message(Bytes &b, int field, const Bytes &s) {
 static void text(Bytes &b, int field, const std::string &s) {
     message(b, field, Bytes(s.begin(), s.end()));
 }
-Bytes connectOptions(int w, int h, int fps, int quality) {
+// 字段号与取值对齐已知能在官方服务器跑通原画的客户端（linux-uuremote viewer，
+// platform=4 Windows 身份）。platform=2 是安卓/TV 语义，会被套大屏弱网码率策略。
+// 二分实验：此函数回滚到 0.1.26 已验证形状（该形状所有版本视频正常）。
+// 0.1.27 的重写版（字段 6 空/删 3/加 9/platform=4 等）导致服务器不再推流。
+Bytes connectOptions(int w, int h, int fps, int quality, uint64_t customBps,
+                     const std::string &device) {
+    (void)device;
     Bytes resolution, capture, decoder, out;
     integer(resolution, 1, w);
     integer(resolution, 2, h);
@@ -147,16 +155,136 @@ Bytes connectOptions(int w, int h, int fps, int quality) {
     integer(capture, 4, 2);
     message(capture, 5, resolution);
     message(capture, 6, resolution);
-    integer(decoder, 1, fps);
+    integer(capture, 7, 1); // chroma 4:2:0
+    if (quality == 6 && customBps)
+        integer(capture, 8, customBps);
+    integer(capture, 11, fps);
+    integer(decoder, 1, 144); // 解码能力上限（服务器按此下发码率策略）
     integer(decoder, 2, 1);
-    integer(decoder, 3, w);
-    integer(decoder, 4, h);
+    integer(decoder, 3, 1920);
+    integer(decoder, 4, 1080);
+    integer(decoder, 5, 1);
     integer(out, 1, 1);
     integer(out, 2, uint64_t(-1));
     message(out, 3, capture);
     message(out, 4, decoder);
-    integer(out, 8, 2);
+    integer(out, 8, 4); // platform = Windows（单变量实验）
+    Bytes feature;
+    integer(feature, 1, 4);
+    message(out, 11, feature);
+    text(out, 12, "4.46.0.4716");
     return out;
+}
+
+std::vector<WireField> decodeWire(const Bytes &data) {
+    std::vector<WireField> fields;
+    size_t pos = 0;
+    auto readVarint = [&](uint64_t &value) {
+        value = 0;
+        int shift = 0;
+        while (pos < data.size() && shift < 64) {
+            uint8_t b = data[pos++];
+            value |= uint64_t(b & 0x7F) << shift;
+            if (!(b & 0x80))
+                return true;
+            shift += 7;
+        }
+        return false;
+    };
+    while (pos < data.size()) {
+        uint64_t key = 0;
+        if (!readVarint(key))
+            return fields;
+        WireField f;
+        f.number = int(key >> 3);
+        int wiretype = int(key & 7);
+        if (wiretype == 0) {
+            if (!readVarint(f.varint))
+                return fields;
+        } else if (wiretype == 2) {
+            uint64_t len = 0;
+            if (!readVarint(len) || pos + len > data.size())
+                return fields;
+            f.bytes.assign(data.begin() + pos, data.begin() + pos + len);
+            pos += len;
+            f.isBytes = true;
+        } else {
+            return fields; // 未知 wiretype，放弃剩余
+        }
+        fields.push_back(std::move(f));
+    }
+    return fields;
+}
+Bytes sessionFeatures() {
+    Bytes f;
+    integer(f, 1, 6);
+    integer(f, 2, 2);
+    integer(f, 3, 1);
+    integer(f, 4, 2);
+    integer(f, 6, 2);
+    integer(f, 7, 2);
+    integer(f, 9, 1);
+    return f;
+}
+Bytes envelope(uint64_t seq, int kind, const Bytes &payload) {
+    Bytes out;
+    integer(out, 1, seq);
+    message(out, kind, payload);
+    return out;
+}
+Bytes echoRequest(uint64_t seq, const Bytes &features) {
+    Bytes action;
+    integer(action, 1, 0); // action 0 = echo 请求
+    message(action, 4, features);
+    return envelope(seq, 3, action);
+}
+Bytes echoResponse(uint64_t seq, uint64_t requestSeq, const Bytes &features) {
+    Bytes action;
+    integer(action, 1, 1); // action 1 = echo 应答
+    text(action, 2, "{\"seq\":" + std::to_string(requestSeq) + "}");
+    message(action, 4, features);
+    return envelope(seq, 3, action);
+}
+Bytes rpcQuality(uint64_t seq, uint64_t requestId, int quality) {
+    Bytes body;
+    integer(body, 1, uint64_t(quality));
+    Bytes header;
+    integer(header, 1, requestId);
+    Bytes rpc;
+    message(rpc, 1, header);
+    message(rpc, 4, body);
+    return envelope(seq, 21, rpc);
+}
+Bytes rpcFps(uint64_t seq, uint64_t requestId, int fps) {
+    Bytes body;
+    integer(body, 1, uint64_t(fps <= 30 ? 1 : 2)); // 菜单序号：1=30 2=60
+    Bytes header;
+    integer(header, 1, requestId);
+    Bytes rpc;
+    message(rpc, 1, header);
+    message(rpc, 3, body);
+    return envelope(seq, 21, rpc);
+}
+// case 2 采集设置：被控端收到它才开始抓屏编码（官方客户端连接后必发）。
+Bytes rpcCaptureSettings(uint64_t seq, uint64_t requestId, int quality, int fps,
+                         uint64_t customBps) {
+    Bytes body;
+    integer(body, 1, uint64_t(fps <= 30 ? 1 : 2)); // 帧率菜单序号
+    integer(body, 2, uint64_t(quality));
+    integer(body, 5, 1280); // local_resolution
+    integer(body, 6, 720);
+    integer(body, 7, 1); // chroma 4:2:0
+    if (quality == 6 && customBps)
+        integer(body, 8, customBps);
+    integer(body, 10, 2); // choose_resolution_type = 本地自适应
+    integer(body, 13, 1); // codec = H264
+    integer(body, 18, uint64_t(fps)); // fpsCount 真实帧率
+    Bytes header;
+    integer(header, 1, requestId);
+    Bytes rpc;
+    message(rpc, 1, header);
+    message(rpc, 2, body);
+    return envelope(seq, 21, rpc);
 }
 Bytes launchApp(uint64_t seq, const Json &app) {
     Bytes p, out;

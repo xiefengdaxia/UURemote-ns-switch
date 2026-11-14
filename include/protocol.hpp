@@ -16,7 +16,26 @@ std::string sign(const std::string &key, const std::string &method, const std::s
 Headers requestHeaders(const std::string &key, const std::string &method, const std::string &path,
                        const std::string &body, const std::string &client, const std::string &device,
                        const std::string &user, int64_t timestamp);
-Bytes connectOptions(int width = 1280, int height = 720, int fps = 30, int quality = 3);
+Bytes connectOptions(int width = 1280, int height = 720, int fps = 30, int quality = 3,
+                     uint64_t customBps = 0, const std::string &device = {});
+
+// 数据通道协议（字段号照官方客户端线上观测，见 linux-uuremote wire.rs）：
+// envelope = {1: seq, <kind>: payload}；echo = Message 3 SimpleAction；
+// RPC = Message 21；服务器实际生效设置 = Message 25 CaptureSettingSync。
+struct WireField {
+    int number = 0;
+    uint64_t varint = 0;
+    Bytes bytes;
+    bool isBytes = false;
+};
+std::vector<WireField> decodeWire(const Bytes &data);
+Bytes sessionFeatures();
+Bytes echoRequest(uint64_t seq, const Bytes &features);
+Bytes echoResponse(uint64_t seq, uint64_t requestSeq, const Bytes &features);
+Bytes rpcQuality(uint64_t seq, uint64_t requestId, int quality);
+Bytes rpcFps(uint64_t seq, uint64_t requestId, int fps);
+Bytes rpcCaptureSettings(uint64_t seq, uint64_t requestId, int quality, int fps,
+                         uint64_t customBps);
 Bytes launchApp(uint64_t seq, const Json &app);
 Json ackValue(const Json &args, const std::string &event);
 Json soac(const Json &client, const std::string &type, const Json &payload, const Json &ice,

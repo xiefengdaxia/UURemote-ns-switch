@@ -4,6 +4,10 @@
 
 基于 C++17 / libnx 的非官方自制程序，独立连接网易 UU 正式服务与原版 UU远程电脑端，接收电脑画面和声音，并通过 Joy-Con 或触屏发送键鼠操作。运行时无需额外网关。
 
+> ⚠️ **非官方项目**：与网易 UU、任天堂均无关联。本仓库**不包含**任何官方二进制、签名密钥或素材；
+> 构建所需的签名常量需使用者自行从合法获得的官方 APK 中提取，本仓库也不提供预编译 NRO。
+> 详见 [NOTICE.md](NOTICE.md)。
+
 ![Platform](https://img.shields.io/badge/platform-Nintendo%20Switch-428580)
 ![Status](https://img.shields.io/badge/status-experimental-d99a36)
 [![License](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](LICENSE)
