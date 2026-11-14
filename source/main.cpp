@@ -242,19 +242,24 @@ int main(int, char **) {
             SDL_RenderSetLogicalSize(renderer, 1280, 720);
             SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
             Fonts fonts;
-            // 签名 key 不随源码分发：由 scripts/extract_key.py 从使用者自己的
-            // UU TV APK 提取到 romfs/signing.key（构建时打进 RomFS）；缺失则拒绝启动。
+            // 签名 key 不随源码/发行包分发：优先读 SD 卡（用户自行从自己的 APK 提取），
+            // 其次读构建时打入 RomFS 的副本；都没有则拒绝启动。
 #ifdef __SWITCH__
-            std::string key = read("romfs:/signing.key");
+            std::string key = read("sdmc:/switch/UURemote-ns/signing.key");
+            if (key.size() != 24)
+                key = read("romfs:/signing.key");
             const std::string profile = "sdmc:/switch/UURemote-ns/client-id";
             mkdir("sdmc:/switch/UURemote-ns", 0777);
 #else
-            std::string key = read("romfs/signing.key");
+            std::string key = read("signing.key");
+            if (key.size() != 24)
+                key = read("romfs/signing.key");
             const std::string profile = "client-id";
 #endif
             if (key.size() != 24)
                 throw std::runtime_error(
-                    "缺少签名 key：请先用 scripts/extract_key.py 从自己的 UU TV APK 提取并重新构建");
+                    "缺少签名 key：请用 scripts/extract_key.py 从自己的 UU TV APK 提取到 "
+                    "sdmc:/switch/UURemote-ns/signing.key");
             uu::diagnostic("app-start-" UU_VERSION);
             std::set_terminate(uu::terminateWithDiagnostics);
             rtc::InitLogger(rtc::LogLevel::Info, [](rtc::LogLevel, const std::string &message) {

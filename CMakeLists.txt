@@ -123,10 +123,17 @@ if(UU_SWITCH)
     target_include_directories(UURemote-ns PRIVATE "${DEVKITPRO}/portlibs/switch/include/SDL2" "${DEVKITPRO}/portlibs/switch/include/opus")
     target_link_libraries(UURemote-ns PRIVATE -Wl,--start-group SDL2_ttf SDL2 freetype harfbuzz png16 EGL glapi drm_nouveau avcodec avutil swscale swresample dav1d opus curl z bz2 nx pthread m -Wl,--end-group)
     set_target_properties(UURemote-ns PROPERTIES SUFFIX ".elf")
+    # 发行构建可指向不含 signing.key 的 RomFS 目录（签名材料不随二进制分发，
+    # 由使用者自行提取到 SD 卡）。默认仍是源码树内的 romfs/。
+    set(UU_ROMFS_DIR "${CMAKE_SOURCE_DIR}/romfs" CACHE PATH "RomFS directory packed into the NRO")
+    set(UU_ROMFS_KEY_DEP)
+    if(EXISTS "${UU_ROMFS_DIR}/signing.key")
+        set(UU_ROMFS_KEY_DEP "${UU_ROMFS_DIR}/signing.key")
+    endif()
     add_custom_command(OUTPUT "${CMAKE_BINARY_DIR}/UURemote-ns.nro"
         COMMAND "${DEVKITPRO}/tools/bin/nacptool" --create "UU Remote NS" "UURemote contributors" "${PROJECT_VERSION}" "${CMAKE_BINARY_DIR}/UURemote-ns.nacp"
-        COMMAND "${DEVKITPRO}/tools/bin/elf2nro" "$<TARGET_FILE:UURemote-ns>" "${CMAKE_BINARY_DIR}/UURemote-ns.nro" "--nacp=${CMAKE_BINARY_DIR}/UURemote-ns.nacp" "--icon=${DEVKITPRO}/libnx/default_icon.jpg" "--romfsdir=${CMAKE_SOURCE_DIR}/romfs"
-        DEPENDS UURemote-ns "${CMAKE_SOURCE_DIR}/romfs/signing.key" VERBATIM)
+        COMMAND "${DEVKITPRO}/tools/bin/elf2nro" "$<TARGET_FILE:UURemote-ns>" "${CMAKE_BINARY_DIR}/UURemote-ns.nro" "--nacp=${CMAKE_BINARY_DIR}/UURemote-ns.nacp" "--icon=${DEVKITPRO}/libnx/default_icon.jpg" "--romfsdir=${UU_ROMFS_DIR}"
+        DEPENDS UURemote-ns ${UU_ROMFS_KEY_DEP} VERBATIM)
     add_custom_target(nro ALL DEPENDS "${CMAKE_BINARY_DIR}/UURemote-ns.nro")
 else()
     find_package(PkgConfig REQUIRED)

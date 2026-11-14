@@ -12,7 +12,7 @@
 ![Status](https://img.shields.io/badge/status-0.1.59-d99a36)
 [![License](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](LICENSE)
 
-[功能](#功能) · [高清修复说明](#高清修复说明) · [按键操作](#按键操作) · [源码构建](#源码构建) · [当前限制](#当前限制)
+[功能](#功能) · [高清修复说明](#高清修复说明) · [按键操作](#按键操作) · [源码构建](#源码构建) · [当前限制](#当前限制) · [English](README.en.md)
 
 ---
 
