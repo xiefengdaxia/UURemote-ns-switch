@@ -12,7 +12,7 @@ sends keyboard / mouse input from Joy-Con or the touch screen. No extra gateway 
 > embedded. See [NOTICE.md](NOTICE.md).
 
 ![Platform](https://img.shields.io/badge/platform-Nintendo%20Switch-428580)
-![Status](https://img.shields.io/badge/status-0.1.59-d99a36)
+![Status](https://img.shields.io/badge/status-0.1.64-d99a36)
 [![License](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](LICENSE)
 
 [Features](#features) · [What was fixed](#what-was-fixed) · [Controls](#controls) · [Building](#building) · [Limitations](#limitations) · [中文](README.md)
